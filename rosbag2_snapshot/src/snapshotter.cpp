@@ -29,6 +29,7 @@
 #include <rclcpp/scope_exit.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rosbag2_snapshot/snapshotter.hpp>
+#include "rosbag2_storage/yaml.hpp"
 
 #include <filesystem>
 
@@ -296,6 +297,8 @@ void Snapshotter::parseOptionsFromParams()
     throw ex;
   }
 
+  RCLCPP_INFO(get_logger(), "Default Duration Limit: %f", options_.default_duration_limit_.seconds());
+
   try {
     options_.default_memory_limit_ =
       declare_parameter<double>("default_memory_limit", -1.0);
@@ -341,7 +344,7 @@ void Snapshotter::parseOptionsFromParams()
 
       try {
         opts.duration_limit_ = rclcpp::Duration::from_seconds(
-          declare_parameter<double>(prefix + ".duration")
+          declare_parameter<double>(prefix + ".duration", opts.duration_limit_.seconds())
         );
       } catch (const rclcpp::ParameterTypeException & ex) {
         if (std::string{ex.what()}.find("not set") == std::string::npos) {
@@ -352,7 +355,9 @@ void Snapshotter::parseOptionsFromParams()
       }
 
       try {
-        opts.memory_limit_ = declare_parameter<double>(prefix + ".memory");
+        opts.memory_limit_ = declare_parameter<double>(prefix + ".memory",
+                                                       static_cast<double>(opts.memory_limit_)
+                                                       );
       } catch (const rclcpp::ParameterTypeException & ex) {
         if (std::string{ex.what()}.find("not set") == std::string::npos) {
           RCLCPP_ERROR(
@@ -433,10 +438,14 @@ void Snapshotter::subscribe(
   opts.topic_stats_options.state = rclcpp::TopicStatisticsState::Enable;
   opts.topic_stats_options.publish_topic = topic_details.name + "/statistics";
 
+  auto subscription_qos_for_topic = rosbag2_transport::Rosbag2QoS::adapt_request_to_offers(
+      topic_details.name, this->get_publishers_info_by_topic(topic_details.name));
+  rosbag2_transport::Rosbag2QoS subscription_qos{subscription_qos_for_topic};
+
   auto sub = create_generic_subscription(
     topic_details.name,
     topic_details.type,
-    rclcpp::QoS{10},
+    subscription_qos,
     std::bind(&Snapshotter::topicCb, this, _1, queue),
     opts
   );
@@ -456,10 +465,17 @@ bool Snapshotter::writeTopic(
 
   MessageQueue::range_t range = message_queue.rangeFromTimes(req->start_time, req->stop_time);
 
+  YAML::Node offered_qos_profiles;
+  auto endpoints = this->get_publishers_info_by_topic(topic_details.name);
+  for (const auto & info : endpoints) {
+    offered_qos_profiles.push_back(rosbag2_transport::Rosbag2QoS(info.qos_profile()));
+  }
+
   rosbag2_storage::TopicMetadata tm;
   tm.name = topic_details.name;
   tm.type = topic_details.type;
   tm.serialization_format = "cdr";
+  tm.offered_qos_profiles = YAML::Dump(offered_qos_profiles);
 
   bag_writer.create_topic(tm);
 
@@ -491,9 +507,12 @@ void Snapshotter::triggerSnapshotCb(
 {
   (void)request_header;
 
+  RCLCPP_INFO(get_logger(), "Snapshot was triggered.");
+
   if (req->filename.empty() || !postfixFilename(req->filename)) {
     res->success = false;
     res->message = "Invalid filename";
+    RCLCPP_INFO(get_logger(), "Error: %s", res->message.c_str());
     return;
   }
 
@@ -506,6 +525,7 @@ void Snapshotter::triggerSnapshotCb(
     if (writing_) {
       res->success = false;
       res->message = "Already writing";
+      RCLCPP_INFO(get_logger(), "Error: %s", res->message.c_str());
       return;
     }
   }
@@ -529,6 +549,7 @@ void Snapshotter::triggerSnapshotCb(
     }
   );
 
+  RCLCPP_INFO(get_logger(), "Begin Writing.");
   rosbag2_cpp::Writer bag_writer{};
 
   try {
@@ -570,6 +591,8 @@ void Snapshotter::triggerSnapshotCb(
       }
     }
   }
+
+  RCLCPP_INFO(get_logger(), "Finished Writing Return Success.");
 
   /*
   // If no topics were subscribed/valid/contained data, this is considered a non-success
@@ -672,7 +695,8 @@ SnapshotterClient::SnapshotterClient(const rclcpp::NodeOptions & options)
   SnapshotterClientOptions opts{};
 
   try {
-    action_str = declare_parameter<std::string>("action_type");
+    declare_parameter<std::string>("action_type", action_str);
+    get_parameter("action_type", action_str);
   } catch (const rclcpp::ParameterTypeException & ex) {
     RCLCPP_ERROR(get_logger(), "action_type parameter is missing or of incorrect type.");
     throw ex;
@@ -692,7 +716,8 @@ SnapshotterClient::SnapshotterClient(const rclcpp::NodeOptions & options)
   std::vector<std::string> topic_names{};
 
   try {
-    topic_names = declare_parameter<std::vector<std::string>>("topics");
+    declare_parameter<std::vector<std::string>>("topics", topic_names);
+    get_parameter("topics", topic_names);
   } catch (const rclcpp::ParameterTypeException & ex) {
     if (std::string{ex.what()}.find("not set") == std::string::npos) {
       RCLCPP_ERROR(get_logger(), "topics must be an array of strings.");
@@ -725,7 +750,8 @@ SnapshotterClient::SnapshotterClient(const rclcpp::NodeOptions & options)
   }
 
   try {
-    opts.filename_ = declare_parameter<std::string>("filename");
+    declare_parameter<std::string>("filename", opts.filename_);
+    get_parameter("filename", opts.filename_);
   } catch (const rclcpp::ParameterTypeException & ex) {
     if (opts.action_ == SnapshotterClientOptions::TRIGGER_WRITE &&
       std::string{ex.what()}.find("not set") == std::string::npos)
@@ -736,7 +762,8 @@ SnapshotterClient::SnapshotterClient(const rclcpp::NodeOptions & options)
   }
 
   try {
-    opts.prefix_ = declare_parameter<std::string>("prefix");
+    declare_parameter<std::string>("prefix", opts.prefix_);
+    get_parameter("prefix", opts.prefix_);
   } catch (const rclcpp::ParameterTypeException & ex) {
     if (opts.action_ == SnapshotterClientOptions::TRIGGER_WRITE &&
       std::string{ex.what()}.find("not set") == std::string::npos)
@@ -756,6 +783,7 @@ SnapshotterClient::SnapshotterClient(const rclcpp::NodeOptions & options)
 
 void SnapshotterClient::setSnapshotterClientOptions(const SnapshotterClientOptions & opts)
 {
+  RCLCPP_INFO(get_logger(), "Trigger Snapshot CB called.");
   if (opts.action_ == SnapshotterClientOptions::TRIGGER_WRITE) {
     auto client = create_client<TriggerSnapshot>("trigger_snapshot");
     if (!client->service_is_ready()) {
